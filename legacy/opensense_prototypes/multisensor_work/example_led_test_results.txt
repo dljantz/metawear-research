@@ -1,0 +1,33 @@
+(metawear_39_env) david-jantz@david-jantz-ThinkPad-E16-Gen-1:~/metawear-research/MetaWear-SDK-Python/opensense/multisensor_work$ sudo systemctl restart bluetooth
+(metawear_39_env) david-jantz@david-jantz-ThinkPad-E16-Gen-1:~/metawear-research/MetaWear-SDK-Python/opensense/multisensor_work$ sudo bluetoothctl power off
+hci0 class of device changed: 0x000000
+hci0 new_settings: ssp br/edr le secure-conn cis-central cis-peripheral 
+Changing power off succeeded
+(metawear_39_env) david-jantz@david-jantz-ThinkPad-E16-Gen-1:~/metawear-research/MetaWear-SDK-Python/opensense/multisensor_work$ sudo bluetoothctl power on
+hci0 class of device changed: 0x6c010c
+[CHG] Controller B8:1E:A4:E1:AB:DC Class: 0x006c010c (7078156)
+hci0 new_settings: powered ssp br/edr le secure-conn cis-central cis-peripheral 
+Changing power on succeeded
+(metawear_39_env) david-jantz@david-jantz-ThinkPad-E16-Gen-1:~/metawear-research/MetaWear-SDK-Python/opensense/multisensor_work$ sudo /home/david-jantz/metawear-research/metawear_39_env/bin/python3 multisensor_led_test.py
+error 1776177591.839720: Error on line: 296 (src/blestatemachine.cc): Operation now in progress
+Connected
+Services disconvered
+Characteristics discovered
+Descriptors found
+Device 0 connected.
+error 1776177595.006316: Error on line: 296 (src/blestatemachine.cc): Operation now in progress
+Connected
+Services disconvered
+Characteristics discovered
+Descriptors found
+Device 1 connected.
+error 1776177600.114746: Error on line: 296 (src/blestatemachine.cc): Operation now in progress
+Connected
+Services disconvered
+Characteristics discovered
+Descriptors found
+Device 2 connected.
+terminate called after throwing an instance of 'std::system_error'
+  what():  Invalid argument
+Aborted
+

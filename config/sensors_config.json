@@ -1,0 +1,59 @@
+{
+  "project_name": "MetaMotion-OpenSim-Pipeline",
+  "fusion_mode": "IMUPlus",
+  "sample_rate_hz": 100.0,
+  "acc_range_g": 16.0,
+  "gyro_range_dps": 2000.0,
+  "default_trial_duration_s": 30.0,
+  "opensim": {
+    "model_file": "Rajagopal_2015.osim",
+    "base_imu_label": "pelvis_imu",
+    "base_heading_axis": "z",
+    "sensor_to_opensim_rotations": "-1.57079632679 0 0",
+    "calibrated_model_file": "Rajagopal_calibrated.osim"
+  },
+  "sensors": [
+    {
+      "name": "torso_imu",
+      "mac": "EE:B2:BC:10:22:7D",
+      "body_segment": "torso",
+      "enabled": true
+    },
+    {
+      "name": "pelvis_imu",
+      "mac": "E5:50:E6:BC:8A:B1",
+      "body_segment": "pelvis",
+      "enabled": true
+    },
+    {
+      "name": "femur_r_imu",
+      "mac": "C2:DC:F0:FE:91:0E",
+      "body_segment": "femur_r",
+      "enabled": true
+    },
+    {
+      "name": "femur_l_imu",
+      "mac": "D4:90:44:9B:41:E0",
+      "body_segment": "femur_l",
+      "enabled": true
+    },
+    {
+      "name": "tibia_r_imu",
+      "mac": "EC:A6:60:F5:9D:23",
+      "body_segment": "tibia_r",
+      "enabled": true
+    },
+    {
+      "name": "tibia_l_imu",
+      "mac": "EF:06:D4:57:BC:22",
+      "body_segment": "tibia_l",
+      "enabled": true
+    },
+    {
+      "name": "head_imu",
+      "mac": "CC:DD:59:8A:67:7A",
+      "body_segment": "head",
+      "enabled": true
+    }
+  ]
+}

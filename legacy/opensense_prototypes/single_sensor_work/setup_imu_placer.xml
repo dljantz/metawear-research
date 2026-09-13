@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<OpenSimDocument Version="40000">
+    <IMUPlacer>
+        <model_file_name>Rajagopal_2015.osim</model_file_name>
+        
+        <orientation_file_name>opensense_orientations.sto</orientation_file_name>
+        
+        <sensor_to_opensim_rotations>-1.57079632679 0 0</sensor_to_opensim_rotations>
+        
+        <base_imu_label>torso_imu</base_imu_label>
+        
+        <base_heading_axis>z</base_heading_axis>
+        
+        <output_model_file>calibrated_Rajagopal_2015.osim</output_model_file>
+    </IMUPlacer>
+</OpenSimDocument>

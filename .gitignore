@@ -1,0 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+metawear_39_env/
+metawear_env/
+venv/
+.venv/
+env/
+ENV/
+
+# MbientLab SDK device cache
+.metawear/
+**/.metawear/
+
+# Cloned Upstream SDK (installed via pip / requirements.txt)
+MetaWear-SDK-Python/
+
+# Trial Outputs & Temporary Data
+# Keep the directory structure, ignore trial dumps
+output/*
+!output/.gitkeep
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor & OS artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp

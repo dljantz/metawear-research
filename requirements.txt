@@ -1,0 +1,18 @@
+# ==============================================================================
+# MetaMotion-OpenSim Pipeline Dependencies
+# ==============================================================================
+
+# Core Processing & Kinematics (Cross-Platform: Windows, Linux, macOS)
+numpy>=1.24.0,<2.1.0
+pandas>=2.0.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+requests>=2.28.0
+pyserial>=3.5
+pytest>=7.0.0
+
+# Hardware BLE Acquisition (Linux Only)
+# Note: PEP 508 environment markers ensure pip skips these on Windows/macOS,
+# preventing MSBuild/C++ compilation failures during offline analysis installs.
+metawear==1.0.7; sys_platform == "linux"
+warble==1.2.9; sys_platform == "linux"

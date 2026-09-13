@@ -1,0 +1,40 @@
+(metawear_39_env) david-jantz@david-jantz-ThinkPad-E16-Gen-1:~/metawear-research/MetaWear-SDK-Python/opensense$ sudo /home/david-jantz/metawear-research/metawear_39_env/bin/python3 scan_connect.py
+[sudo] password for david-jantz: 
+scanning for devices...
+[0] 53:9B:20:BC:28:C2 (unknown)
+[1] 6B:CE:F2:1A:6F:CD (unknown)
+[2] F3:A3:7B:95:51:CD (MetaWear)
+[3] 65:42:49:D8:4D:A7 (unknown)
+[4] CC:DD:59:8A:67:7A (MetaWear)
+[5] D8:FB:07:F7:24:50 (MetaWear)
+[6] 64:3B:A1:CE:C8:67 (unknown)
+[7] 50:25:0D:F4:1E:0A (unknown)
+[8] 20:09:50:81:DE:18 (unknown)
+Select your device (-1 to rescan): 5
+Connecting to D8:FB:07:F7:24:50...
+Connected to D8:FB:07:F7:24:50 over USB
+Device information: {'model': '8', 'hardware': '0.1', 'manufacturer': 'MbientLab', 'serial': '055A22', 'firmware': '1.7.2'}
+Disconnected
+(metawear_39_env) david-jantz@david-jantz-ThinkPad-E16-Gen-1:~/metawear-research/MetaWear-SDK-Python/opensense$ sudo /home/david-jantz/metawear-research/metawear_39_env/bin/python3 scan_connect.py
+scanning for devices...
+[0] 50:25:0D:F4:1E:0A (unknown)
+[1] 53:9B:20:BC:28:C2 (unknown)
+[2] D8:FB:07:F7:24:50 (MetaWear)
+[3] 75:24:90:E5:5A:54 (unknown)
+[4] CC:DD:59:8A:67:7A (MetaWear)
+[5] F3:A3:7B:95:51:CD (MetaWear)
+[6] 64:3B:A1:CE:C8:67 (unknown)
+[7] 6B:CE:F2:1A:6F:CD (unknown)
+[8] 21:37:EE:58:19:C0 (unknown)
+[9] 34:7F:89:4F:5D:FE (unknown)
+[10] 65:42:49:D8:4D:A7 (unknown)
+[11] 33:EA:1C:B1:D2:21 (unknown)
+Select your device (-1 to rescan): 5
+Connecting to F3:A3:7B:95:51:CD...
+error 1776175885.000917: Error on line: 296 (src/blestatemachine.cc): Operation now in progress
+Traceback (most recent call last):
+  File "/home/david-jantz/metawear-research/MetaWear-SDK-Python/opensense/scan_connect.py", line 38, in <module>
+    device.connect()
+  File "/home/david-jantz/metawear-research/metawear_39_env/lib/python3.9/site-packages/mbientlab/metawear/metawear.py", line 407, in connect
+    raise result[0]
+

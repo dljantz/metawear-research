@@ -249,6 +249,8 @@ def get_all_bluetooth_adapters(auto_power_on: bool = True, timeout_s: float = 3.
 
     if any_powered_on:
         time.sleep(1.0)
+        # Re-query without auto_power_on so re-enumerated interfaces (e.g. hci0 -> hci2) are accurately mapped
+        return get_all_bluetooth_adapters(auto_power_on=False, timeout_s=timeout_s)
 
     adapter_list = list(adapters.values())
     # Sort default adapter first
@@ -265,6 +267,13 @@ def ensure_bluetooth_ready(auto_power_on: bool = True, verbose: bool = False, re
     Raises:
         BluetoothAdapterError: If no adapter is found or powered on.
     """
+    # 0. Ensure Warble FD_SETSIZE patch is in place
+    try:
+        from scripts.patch_warble import ensure_warble_patched
+        ensure_warble_patched(verbose=False)
+    except Exception:
+        pass
+
     # 1. Unblock rfkill
     unblock_rfkill()
 

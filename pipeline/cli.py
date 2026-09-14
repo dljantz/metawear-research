@@ -202,7 +202,7 @@ def cmd_record(args):
     # 3. Halt logging immediately on all armed sensors to freeze flash memory
     bm.stop_sensors(target_sensors=armed_sensors)
 
-    # 4. Download data (concurrently if multiple adapters available)
+    # 4. Download data (sequential by default with second-pass retry queue)
     downloaded_files = bm.download_sensors(output_dir, target_sensors=armed_sensors)
     if not downloaded_files:
         raise RuntimeError("No sensor data could be downloaded. Aborting downstream processing.")

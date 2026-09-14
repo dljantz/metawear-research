@@ -5,6 +5,7 @@
   "acc_range_g": 16.0,
   "gyro_range_dps": 2000.0,
   "default_trial_duration_s": 30.0,
+  "parallel_downloads": false,
   "opensim": {
     "model_file": "Rajagopal_2015.osim",
     "base_imu_label": "pelvis_imu",

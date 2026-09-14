@@ -83,6 +83,7 @@ class BoardManager:
         self.fusion_mode = get_fusion_mode(config.get("fusion_mode", "IMUPlus"))
         self.acc_range = get_acc_range(config.get("acc_range_g", 16.0))
         self.gyro_range = get_gyro_range(config.get("gyro_range_dps", 2000.0))
+        self.parallel_downloads = bool(config.get("parallel_downloads", False))
         
         configured_hci = config.get("hci_mac")
         if configured_hci:
@@ -97,10 +98,13 @@ class BoardManager:
             self.adapters = all_adapters
             self.hci_macs = [a["mac"] for a in all_adapters]
             self.hci_mac = self.hci_macs[0]
-            if len(self.hci_macs) == 1:
+            if not self.parallel_downloads or len(self.hci_macs) == 1:
                 ad = all_adapters[0]
                 status_tag = "Powered & Ready, Blue LED ON" if ad.get("powered") else "Detected"
-                print(f"Active Bluetooth Adapter: {self.hci_mac} ({status_tag})")
+                tag = f"{ad.get('hci', 'hci')} | {ad.get('name', 'Bluetooth Adapter')}"
+                print(f"Active Bluetooth Adapter: {self.hci_mac} ({tag}) [{status_tag}]")
+                if len(self.hci_macs) > 1:
+                    print(f"  (Sequential execution enabled: {len(self.hci_macs)} adapters detected, operating sequentially on primary {ad.get('hci', 'hci')})")
             else:
                 print(f"✓ Detected {len(self.hci_macs)} Active Bluetooth Adapters for Parallel Operations:")
                 for i, ad in enumerate(all_adapters, 1):
@@ -436,7 +440,7 @@ class BoardManager:
                 return (name, False, str(e))
 
         num_adapters = len(self.hci_macs)
-        if num_adapters > 1:
+        if self.parallel_downloads and num_adapters > 1:
             from concurrent.futures import ThreadPoolExecutor
             import queue
 
@@ -468,6 +472,19 @@ class BoardManager:
                     stopped.append(s_name)
                 else:
                     failed.append((s_name, err))
+
+            # Quick sequential retry pass for any sensors that failed on the first sweep attempt
+            if failed:
+                retry_names = [f[0] for f in failed]
+                failed = []
+                for s in sensors_to_stop:
+                    if s["name"] in retry_names:
+                        time.sleep(0.5)
+                        s_name, ok, err = _stop_single(s, self.hci_mac)
+                        if ok:
+                            stopped.append(s_name)
+                        else:
+                            failed.append((s_name, err))
 
         print(f"✓ Stop sweep complete: {len(stopped)} of {len(sensors_to_stop)} confirmed stopped.\n")
         return stopped
@@ -592,6 +609,7 @@ class BoardManager:
             start_timeout_s = 25.0    # Stalled if download never begins after 25s
 
             stalled = False
+            stall_reason = ""
             while not download_evt.is_set():
                 time_since_data = time.time() - last_data_time[0]
                 elapsed = time.time() - download_start
@@ -599,46 +617,55 @@ class BoardManager:
 
                 # Only declare stalled if incoming packet flow has completely frozen
                 if total_samples > 0 and time_since_data > stall_threshold_s:
-                    with self._print_lock:
-                        print(f"\n  ⚠️ [{name}] Download stalled: no new data packets received for {int(time_since_data)}s.")
-                        print(f"  [{name}] Preserving {len(quat_data)} quat and {len(accel_data)} accel samples received before stall.")
+                    stall_reason = f"no new data packets received for {int(time_since_data)}s"
                     stalled = True
                     break
 
                 if total_samples == 0 and elapsed > start_timeout_s:
-                    with self._print_lock:
-                        print(f"\n  ⚠️ [{name}] Download failed to start: no data packets received after {int(elapsed)}s.")
+                    stall_reason = f"no data packets received after {int(elapsed)}s"
                     stalled = True
                     break
 
                 download_evt.wait(timeout=0.5)
 
-            if not stalled:
-                if total_entries_count[0] > 0:
-                    with self._print_lock:
-                        print(f"  [{name}] Download: 100.0% ({total_entries_count[0]}/{total_entries_count[0]} entries) | {len(quat_data)} quats, {len(accel_data)} accels")
-
-                # Clear flash entries and tear down board state only upon clean completion
-                libmetawear.mbl_mw_logging_clear_entries(board)
-                time.sleep(3.0)  # Wait for physical SPI NOR flash sector erase
-                libmetawear.mbl_mw_event_remove_all(board)
-                libmetawear.mbl_mw_macro_erase_all(board)
-                libmetawear.mbl_mw_metawearboard_tear_down(board)
-                time.sleep(0.5)
-
+            if stalled:
+                with self._print_lock:
+                    print(f"\n  ⚠️ [{name}] Download stalled: {stall_reason}.")
+                    print(f"  [{name}] Discarding {len(quat_data)} quats / {len(accel_data)} accels to prevent data truncation.")
+                    print(f"  [{name}] Sensor on-board flash is preserved for retry.")
                 try:
-                    dev.disconnect()
+                    libmetawear.mbl_mw_metawearboard_tear_down(board)
                 except Exception:
                     pass
-                time.sleep(1.0)
-            else:
                 try:
                     dev.disconnect()
                 except Exception:
                     pass
                 time.sleep(2.0)
+                raise RuntimeError(
+                    f"Download from {name} stalled after {len(quat_data)} quats ({stall_reason})"
+                )
 
-            # Save raw CSVs
+            # Reached here only if NOT stalled and cleanly completed 100%
+            if total_entries_count[0] > 0:
+                with self._print_lock:
+                    print(f"  [{name}] Download: 100.0% ({total_entries_count[0]}/{total_entries_count[0]} entries) | {len(quat_data)} quats, {len(accel_data)} accels")
+
+            # Clear flash entries and tear down board state only upon clean 100% completion
+            libmetawear.mbl_mw_logging_clear_entries(board)
+            time.sleep(3.0)  # Wait for physical SPI NOR flash sector erase
+            libmetawear.mbl_mw_event_remove_all(board)
+            libmetawear.mbl_mw_macro_erase_all(board)
+            libmetawear.mbl_mw_metawearboard_tear_down(board)
+            time.sleep(0.5)
+
+            try:
+                dev.disconnect()
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+            # Save complete raw CSVs
             quat_file = output_dir / f"{name}_quat.csv"
             with open(quat_file, mode="w", newline="") as f:
                 writer = csv.writer(f)
@@ -678,24 +705,22 @@ class BoardManager:
             raise exc
 
     def download_sensors(self, output_dir: Path, target_sensors: list = None) -> dict:
-        """Download logged data from sensors.
+        """Download logged data from sensors with second-pass retry resilience.
 
-        Runs concurrently across available Bluetooth adapters when multiple are detected,
-        or sequentially when a single adapter is in use.
+        Runs sequentially by default to eliminate 2.4 GHz RF packet collisions and USB controller
+        contention, or concurrently if 'parallel_downloads' is explicitly enabled in config.
+        Any sensor that fails connection, discovery, or stalls is retried in a dedicated second pass.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         sensors_to_download = target_sensors if target_sensors is not None else self.sensors
         num_adapters = len(self.hci_macs)
-
-        if num_adapters > 1:
-            print(f"\n=== Downloading Data from {len(sensors_to_download)} Sensors Concurrently ({num_adapters} Bluetooth Adapters) ===")
-        else:
-            print(f"\n=== Downloading Data from {len(sensors_to_download)} Sensors Sequentially ===")
+        use_parallel = self.parallel_downloads and num_adapters > 1
 
         downloaded_files = {}
-        failed_downloads = []
+        failed_first_pass = []
 
-        if num_adapters > 1:
+        if use_parallel:
+            print(f"\n=== Downloading Data from {len(sensors_to_download)} Sensors Concurrently ({num_adapters} Bluetooth Adapters) ===")
             from concurrent.futures import ThreadPoolExecutor
             import queue
 
@@ -716,8 +741,9 @@ class BoardManager:
                         downloaded_files[s_name] = res
                     except Exception as e:
                         with self._print_lock:
-                            print(f"  ✗ FAILED TO DOWNLOAD FROM {s_name}: {e}")
-                        failed_downloads.append((s_name, str(e)))
+                            print(f"  ⚠️ [First Pass] Failed to download from {s_name}: {e}")
+                            print(f"  [{s_name}] Sensor data preserved on flash. Added to Second-Pass Retry Queue.")
+                        failed_first_pass.append(sensor)
                     finally:
                         sensor_q.task_done()
 
@@ -726,19 +752,53 @@ class BoardManager:
                 for f in futures:
                     f.result()
         else:
+            print(f"\n=== Downloading Data from {len(sensors_to_download)} Sensors Sequentially ===")
+            print(f"  Active Bluetooth Adapter: {self.hci_mac}")
+
             for sensor in sensors_to_download:
                 name = sensor["name"]
                 try:
                     res = self._download_single_sensor(sensor, output_dir, assigned_hci=self.hci_mac)
                     downloaded_files[name] = res
                 except Exception as e:
-                    print(f"  ✗ FAILED TO DOWNLOAD FROM {name}: {e}")
-                    failed_downloads.append((name, str(e)))
+                    print(f"  ⚠️ [First Pass] Failed to download from {name}: {e}")
+                    print(f"  [{name}] Sensor data preserved on flash. Added to Second-Pass Retry Queue.")
+                    failed_first_pass.append(sensor)
 
-        if failed_downloads:
-            print(f"\n⚠️ WARNING: {len(failed_downloads)} sensor(s) failed during download:")
-            for s_name, err in failed_downloads:
-                print(f"   - {s_name}: {err}")
+        # --- PASS 2: Dedicated Second-Pass Retry Queue ---
+        if failed_first_pass:
+            print("\n" + "=" * 60)
+            print(f"  === SECOND-PASS RETRY QUEUE ({len(failed_first_pass)} Sensor(s) to Retry) ===")
+            print("  Waiting 3.0s for Bluetooth adapter and radio channels to settle...")
+            print("=" * 60)
+            time.sleep(3.0)
+
+            permanently_failed = []
+            for sensor in failed_first_pass:
+                name = sensor["name"]
+                success = False
+                max_retries = 2
+                for attempt in range(1, max_retries + 1):
+                    print(f"\n[Second-Pass Retry {attempt}/{max_retries}] Retrying download for {name} ({sensor['mac']})...")
+                    try:
+                        res = self._download_single_sensor(sensor, output_dir, assigned_hci=self.hci_mac)
+                        downloaded_files[name] = res
+                        success = True
+                        print(f"  ✓ [Second-Pass Success] {name} successfully downloaded on retry attempt {attempt}!")
+                        break
+                    except Exception as e:
+                        print(f"  ✗ [Second-Pass Attempt {attempt}/{max_retries}] Retry failed for {name}: {e}")
+                        time.sleep(2.0)
+
+                if not success:
+                    permanently_failed.append(name)
+
+            if permanently_failed:
+                print(f"\n⚠️ WARNING: {len(permanently_failed)} sensor(s) permanently failed download after retries:")
+                for s_name in permanently_failed:
+                    print(f"   - {s_name}")
+            else:
+                print(f"\n✓ Second-Pass Retry Queue recovered all previously failed sensors!")
 
         print(f"\n✓ Download complete: {len(downloaded_files)} of {len(sensors_to_download)} succeeded.")
         return downloaded_files

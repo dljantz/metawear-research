@@ -1,9 +1,23 @@
 import sys
+from pathlib import Path
 import time
 import csv
 from threading import Event
+
+# Add project root for bluetooth_utils import
+for parent in Path(__file__).resolve().parents:
+    if (parent / "pipeline").exists():
+        sys.path.insert(0, str(parent))
+        break
+
+from pipeline.core.bluetooth_utils import ensure_bluetooth_ready
 from mbientlab.metawear import MetaWear, libmetawear, parse_value
 from mbientlab.metawear.cbindings import *
+
+# Ensure Bluetooth adapter is unblocked and powered on (blue LED on)
+adapter_info = ensure_bluetooth_ready(auto_power_on=True)
+HCI_MAC = adapter_info["mac"]
+print(f"Active Bluetooth Adapter: {HCI_MAC} (Blue LED ON)")
 
 # --- 1. CONFIGURATION ---
 TRIAL_DURATION_S = 30.0
@@ -21,7 +35,7 @@ callbacks = [] # CRITICAL: Prevents C-callbacks from being garbage collected
 class DeviceState:
     def __init__(self, config):
         self.name = config["name"]
-        self.device = MetaWear(config["mac"])
+        self.device = MetaWear(config["mac"], hci_mac=HCI_MAC)
         self.loggers = []
         self.quat_data = []
         self.accel_data = []

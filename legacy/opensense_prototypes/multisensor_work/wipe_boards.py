@@ -6,16 +6,29 @@ avoided by running this script between data collection runs.
 """
 
 import sys
+from pathlib import Path
 from time import sleep
+
+# Add project root for bluetooth_utils import
+for parent in Path(__file__).resolve().parents:
+    if (parent / "pipeline").exists():
+        sys.path.insert(0, str(parent))
+        break
+
+from pipeline.core.bluetooth_utils import ensure_bluetooth_ready
 from mbientlab.metawear import MetaWear, libmetawear
 
 # printed on backs of sensors
 addresses = ["D8:FB:07:F7:24:50", "F3:A3:7B:95:51:CD"]
 devices = []
 
+adapter_info = ensure_bluetooth_ready(auto_power_on=True)
+hci_mac = adapter_info["mac"]
+print(f"Active Bluetooth Adapter: {hci_mac} (Blue LED ON)")
+
 for address in addresses:
     print(f"Connecting to {address} to wipe...")
-    devices.append(MetaWear(address)) # Calling the MetaWear constructor returns a MetaWear object, append to devices list
+    devices.append(MetaWear(address, hci_mac=hci_mac)) # Calling the MetaWear constructor returns a MetaWear object, append to devices list
     devices[-1].connect()
 
 for device in devices:

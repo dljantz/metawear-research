@@ -95,18 +95,61 @@ def cmd_list(args):
     print(f"Sample Rate: {config.get('sample_rate_hz', 100.0)} Hz")
 
 
+def cmd_ble_check(args):
+    """Diagnose Bluetooth controllers, unblock rfkill, and power on all adapters."""
+    print("\n=== Checking Bluetooth Hardware & Adapter Readiness ===")
+    try:
+        from pipeline.core.bluetooth_utils import ensure_bluetooth_ready, is_service_active, get_all_bluetooth_adapters
+        service_status = "active" if is_service_active() else "inactive"
+        print(f"  • Bluetooth Service (systemd): {service_status}")
+        
+        adapters = get_all_bluetooth_adapters(auto_power_on=True)
+        if not adapters:
+            print("  ✗ No Bluetooth adapters detected.")
+            sys.exit(1)
+
+        print(f"  • Detected Bluetooth Adapter(s): {len(adapters)}")
+        for i, ad in enumerate(adapters, 1):
+            powered_str = "YES (Powered & Ready, Blue LED ON)" if ad.get("powered") else "NO"
+            default_tag = " [Default]" if ad.get("is_default") else ""
+            print(f"    [{i}] MAC:     {ad['mac']}{default_tag}")
+            print(f"        HCI:     {ad.get('hci', 'hci')}")
+            print(f"        Name:    {ad.get('name', 'Unknown')}")
+            print(f"        Powered: {powered_str}")
+
+        if len(adapters) > 1:
+            print(f"\n✓ Multiple adapters detected! Pipeline will run operations in parallel.")
+        else:
+            print(f"\n✓ Bluetooth adapter is powered ON and ready for MetaWear acquisitions.")
+    except Exception as e:
+        print(f"\n✗ Bluetooth Check Failed: {e}")
+        sys.exit(1)
+
+
 def cmd_test(args):
-    config = load_config(args.config)
-    BoardManager = _get_board_manager_class()
-    bm = BoardManager(config)
-    bm.test_connections(blink_seconds=args.blink_time)
+    try:
+        config = load_config(args.config)
+        BoardManager = _get_board_manager_class()
+        bm = BoardManager(config)
+        bm.test_connections(blink_seconds=args.blink_time)
+    except Exception as e:
+        if "Bluetooth" in type(e).__name__ or "Bluetooth" in str(e):
+            print(f"\n[Bluetooth Error] {e}")
+            sys.exit(1)
+        raise
 
 
 def cmd_wipe(args):
-    config = load_config(args.config)
-    BoardManager = _get_board_manager_class()
-    bm = BoardManager(config)
-    bm.wipe_all()
+    try:
+        config = load_config(args.config)
+        BoardManager = _get_board_manager_class()
+        bm = BoardManager(config)
+        bm.wipe_all()
+    except Exception as e:
+        if "Bluetooth" in type(e).__name__ or "Bluetooth" in str(e):
+            print(f"\n[Bluetooth Error] {e}")
+            sys.exit(1)
+        raise
 
 
 def cmd_record(args):
@@ -156,7 +199,10 @@ def cmd_record(args):
     print("\n\n*** TRIAL COMPLETE! Stand still for 1 second... ***")
     time.sleep(1.0)
 
-    # 3. Download data sequentially
+    # 3. Halt logging immediately on all armed sensors to freeze flash memory
+    bm.stop_sensors(target_sensors=armed_sensors)
+
+    # 4. Download data (concurrently if multiple adapters available)
     downloaded_files = bm.download_sensors(output_dir, target_sensors=armed_sensors)
     if not downloaded_files:
         raise RuntimeError("No sensor data could be downloaded. Aborting downstream processing.")
@@ -236,12 +282,15 @@ def main():
     parser.add_argument("--config", type=Path, default=None, help="Path to custom sensors_config.json")
     subparsers = parser.add_subparsers(dest="command", help="Pipeline subcommands")
 
+    # ble-check
+    subparsers.add_parser("ble-check", help="Check Bluetooth adapter, unblock rfkill, and power on antenna")
+
     # list
     subparsers.add_parser("list", help="List configured sensors and status")
 
     # test
-    sub_test = subparsers.add_parser("test", help="Test BLE connectivity and blink LEDs")
-    sub_test.add_argument("--blink-time", type=float, default=2.5, help="Seconds to blink LED")
+    sub_test = subparsers.add_parser("test", help="Test BLE connectivity and quick-flash LEDs")
+    sub_test.add_argument("--blink-time", type=float, default=0.5, help="Seconds to flash LED (default: 0.5s quick flash)")
 
     # wipe
     subparsers.add_parser("wipe", help="Wipe flash memory and reset all sensors")
@@ -262,7 +311,9 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if args.command == "list":
+    if args.command == "ble-check":
+        cmd_ble_check(args)
+    elif args.command == "list":
         cmd_list(args)
     elif args.command == "test":
         cmd_test(args)
@@ -275,4 +326,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # Cleanly terminate immediately without triggering libwarble C++ static destructor segfaults during Python interpreter teardown
+        os._exit(0)
+    except KeyboardInterrupt:
+        print("\n\n[Process Interrupted] Operation aborted by user. Exiting cleanly.")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(130)

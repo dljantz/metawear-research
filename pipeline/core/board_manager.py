@@ -14,7 +14,8 @@ import sys
 import time
 import csv
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
+from typing import Optional, Dict, List, Any
 from ctypes import cast, byref, POINTER, c_void_p
 
 from mbientlab.metawear import MetaWear, libmetawear, parse_value
@@ -72,41 +73,7 @@ def get_gyro_range(dps: float) -> int:
     return SensorFusionGyroRange._250DPS
 
 
-import re
-import subprocess
-
-def detect_active_hci_mac() -> str:
-    """Detect the active/default Bluetooth controller's BD Address (MAC).
-
-    Ensures Warble uses the correct Bluetooth adapter (e.g. hci1 / USB dongle)
-    instead of defaulting to hci0, which triggers the FD_SETSIZE crash if hci0 is absent.
-    """
-    # 1. Try bluetoothctl list (preferred for default controller)
-    try:
-        out = subprocess.check_output(["bluetoothctl", "list"], text=True, stderr=subprocess.DEVNULL)
-        lines = out.strip().splitlines()
-        for line in lines:
-            m = re.search(r"Controller\s+([0-9A-Fa-f:]{17})", line)
-            if m:
-                if "[default]" in line or len(lines) == 1:
-                    return m.group(1).upper()
-        if lines:
-            m = re.search(r"Controller\s+([0-9A-Fa-f:]{17})", lines[0])
-            if m:
-                return m.group(1).upper()
-    except Exception:
-        pass
-
-    # 2. Try hciconfig
-    try:
-        out = subprocess.check_output(["hciconfig"], text=True, stderr=subprocess.DEVNULL)
-        m = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", out)
-        if m:
-            return m.group(1).upper()
-    except Exception:
-        pass
-
-    return None
+from pipeline.core.bluetooth_utils import ensure_bluetooth_ready, BluetoothAdapterError
 
 
 class BoardManager:
@@ -116,23 +83,59 @@ class BoardManager:
         self.fusion_mode = get_fusion_mode(config.get("fusion_mode", "IMUPlus"))
         self.acc_range = get_acc_range(config.get("acc_range_g", 16.0))
         self.gyro_range = get_gyro_range(config.get("gyro_range_dps", 2000.0))
-        self.hci_mac = config.get("hci_mac") or detect_active_hci_mac()
-        if self.hci_mac:
-            print(f"Active Bluetooth Adapter: {self.hci_mac}")
+        
+        configured_hci = config.get("hci_mac")
+        if configured_hci:
+            if isinstance(configured_hci, (list, tuple)):
+                self.hci_macs = [m.upper() for m in configured_hci]
+            else:
+                self.hci_macs = [configured_hci.upper()]
+            self.hci_mac = self.hci_macs[0]
+            print(f"Using configured Bluetooth Adapter(s): {', '.join(self.hci_macs)}")
+        else:
+            all_adapters = ensure_bluetooth_ready(auto_power_on=True, return_all=True)
+            self.adapters = all_adapters
+            self.hci_macs = [a["mac"] for a in all_adapters]
+            self.hci_mac = self.hci_macs[0]
+            if len(self.hci_macs) == 1:
+                ad = all_adapters[0]
+                status_tag = "Powered & Ready, Blue LED ON" if ad.get("powered") else "Detected"
+                print(f"Active Bluetooth Adapter: {self.hci_mac} ({status_tag})")
+            else:
+                print(f"✓ Detected {len(self.hci_macs)} Active Bluetooth Adapters for Parallel Operations:")
+                for i, ad in enumerate(all_adapters, 1):
+                    tag = f"{ad.get('hci', 'hci')} | {ad.get('name', 'Bluetooth Adapter')}"
+                    print(f"   [{i}] {ad['mac']} ({tag})")
 
-    def _connect_device(self, mac: str, max_retries: int = 3, timeout_s: float = 10.0) -> MetaWear:
-        """Connect to a device with retry logic and robust error status handling."""
+        # Persistent device cache keyed by (device_mac, hci_mac) to prevent C++ / ctypes GC corruption
+        self.devices = {}
+        self._callbacks = []
+        self._print_lock = Lock()
+
+    def _connect_device(self, mac: str, hci_mac: Optional[str] = None, max_retries: int = 3, timeout_s: float = 10.0) -> MetaWear:
+        """Connect to a device with retry logic, instance caching, and robust error status handling."""
+        target_hci = (hci_mac or self.hci_mac).upper()
+        if not target_hci:
+            raise BluetoothAdapterError(
+                "Cannot connect: No active Bluetooth adapter is available.\n"
+                "Please plug in your USB Bluetooth antenna."
+            )
         last_err = None
-        kwargs = {}
-        if self.hci_mac:
-            kwargs["hci_mac"] = self.hci_mac
+        device_key = (mac.upper(), target_hci)
+
+        # Reuse existing persistent device instance to avoid re-instantiation and GC corruption in libwarble
+        device = self.devices.get(device_key)
+        if device is None:
+            device = MetaWear(mac, hci_mac=target_hci)
+            # Enforce BLE connection: prevent SDK from switching to USB mode when sensor is charging via laptop USB port
+            type(device.usb).is_enumerated = property(lambda self: False)
+            self.devices[device_key] = device
+
+        if device.is_connected:
+            return device
 
         for attempt in range(1, max_retries + 1):
             try:
-                device = MetaWear(mac, **kwargs)
-                # Enforce BLE connection: prevent SDK from switching to USB mode when sensor is charging via laptop USB port
-                type(device.usb).is_enumerated = property(lambda self: False)
-                
                 # Robust connect_async wrapper to handle integer status codes from MetaWear C++
                 conn_evt = Event()
                 conn_res = []
@@ -154,14 +157,20 @@ class BoardManager:
                     else:
                         raise RuntimeError(f"Device connection failed with status {err}")
 
-                # Optimize BLE connection interval (7.5ms) for stable low-latency comms
-                libmetawear.mbl_mw_settings_set_connection_parameters(device.board, 7.5, 7.5, 0, 6000)
-                time.sleep(1.0)
+                # Optimize BLE connection interval: 7.5ms min, 15.0ms max, 0 latency, 4000ms supervision timeout
+                # Satisfies Linux kernel BLE specs to prevent 'ignoring invalid connection parameters'
+                libmetawear.mbl_mw_settings_set_connection_parameters(device.board, 7.5, 15.0, 0, 4000)
+                time.sleep(0.5)
                 return device
             except Exception as e:
                 last_err = e
                 print(f"  [Attempt {attempt}/{max_retries}] Connecting to {mac} failed: {e}")
+                try:
+                    device.disconnect()
+                except Exception:
+                    pass
                 time.sleep(1.5)
+        self.devices.pop(device_key, None)
         raise RuntimeError(f"Could not connect to {mac} after {max_retries} attempts: {last_err}")
 
     def read_battery(self, board) -> dict:
@@ -184,12 +193,12 @@ class BoardManager:
         libmetawear.mbl_mw_datasignal_unsubscribe(signal)
         return batt_data
 
-    def test_connections(self, blink_seconds: float = 2.5):
-        """Sequential connection & diagnostic test: checks battery, blinks LED."""
+    def test_connections(self, blink_seconds: float = 0.5):
+        """Sequential connection & diagnostic test: checks battery, quick flash LED."""
         print(f"\n=== Testing Connections for {len(self.sensors)} Enabled Sensors ===")
         results = {}
 
-        pattern = LedPattern(repeat_count=Const.LED_REPEAT_INDEFINITELY)
+        pattern = LedPattern(repeat_count=1)
         libmetawear.mbl_mw_led_load_preset_pattern(byref(pattern), LedPreset.BLINK)
 
         for sensor in self.sensors:
@@ -209,15 +218,15 @@ class BoardManager:
                 if batt['charge'] is not None and batt['charge'] < 20:
                     print(f"  ⚠️ WARNING: Low battery on {name} ({batt['charge']}%). Please charge before trial!")
 
-                # Blink green
+                # Quick flash green LED
                 libmetawear.mbl_mw_led_write_pattern(dev.board, byref(pattern), LedColor.GREEN)
                 libmetawear.mbl_mw_led_play(dev.board)
                 time.sleep(blink_seconds)
                 libmetawear.mbl_mw_led_stop_and_clear(dev.board)
-                time.sleep(0.3)
+                time.sleep(0.2)
 
                 dev.disconnect()
-                time.sleep(0.8)
+                time.sleep(0.5)
                 results[name] = {
                     "status": "OK",
                     "battery": charge_str,
@@ -254,9 +263,9 @@ class BoardManager:
                 libmetawear.mbl_mw_logging_flush_page(board)
                 time.sleep(0.3)
 
-                print("  Clearing log entries...")
+                print("  Clearing log entries (waiting 3.0s for SPI flash erase)...")
                 libmetawear.mbl_mw_logging_clear_entries(board)
-                time.sleep(0.5)
+                time.sleep(3.0)
 
                 print("  Removing events & macros...")
                 libmetawear.mbl_mw_event_remove_all(board)
@@ -308,16 +317,25 @@ class BoardManager:
                     if batt['charge'] < 15:
                         print(f"  ⚠️ CRITICAL: {name} battery very low ({batt['charge']}%). May drop during trial!")
 
-                # Clear stale entries
+                # Proactively tear down any stale loggers/events/macros and wipe flash
                 libmetawear.mbl_mw_logging_stop(board)
+                libmetawear.mbl_mw_sensor_fusion_stop(board)
+                time.sleep(0.2)
+                libmetawear.mbl_mw_logging_flush_page(board)
+                time.sleep(0.2)
                 libmetawear.mbl_mw_logging_clear_entries(board)
-                time.sleep(0.3)
+                time.sleep(3.0)  # Physical erase of SPI NOR flash sectors requires ~2-3 seconds
+                libmetawear.mbl_mw_event_remove_all(board)
+                libmetawear.mbl_mw_macro_erase_all(board)
+                libmetawear.mbl_mw_metawearboard_tear_down(board)
+                time.sleep(0.5)
 
                 # Configure Sensor Fusion
                 libmetawear.mbl_mw_sensor_fusion_set_mode(board, self.fusion_mode)
                 libmetawear.mbl_mw_sensor_fusion_set_acc_range(board, self.acc_range)
                 libmetawear.mbl_mw_sensor_fusion_set_gyro_range(board, self.gyro_range)
                 libmetawear.mbl_mw_sensor_fusion_write_config(board)
+                time.sleep(0.5)
 
                 # Obtain data signals directly from fusion engine
                 quat_signal = libmetawear.mbl_mw_sensor_fusion_get_data_signal(board, SensorFusionData.QUATERNION)
@@ -326,24 +344,29 @@ class BoardManager:
                 # Set up loggers
                 setup_evt = Event()
                 loggers = []
+                logger_err = [None]
 
                 def on_logger_created(ctx, ptr):
                     if ptr:
                         loggers.append(ptr)
+                    else:
+                        logger_err[0] = "Board returned NULL logger pointer (logger slots full or dirty state)"
                     setup_evt.set()
 
                 logger_cb = FnVoid_VoidP_VoidP(on_logger_created)
-                callbacks.append(logger_cb)
+                self._callbacks.append(logger_cb)
 
                 setup_evt.clear()
                 libmetawear.mbl_mw_datasignal_log(quat_signal, None, logger_cb)
-                if not setup_evt.wait(timeout=5.0):
-                    raise TimeoutError(f"Timeout creating quaternion logger for {name}")
+                if not setup_evt.wait(timeout=5.0) or len(loggers) < 1:
+                    err_msg = logger_err[0] or f"Timeout creating quaternion logger for {name}"
+                    raise TimeoutError(err_msg)
 
                 setup_evt.clear()
                 libmetawear.mbl_mw_datasignal_log(acc_signal, None, logger_cb)
-                if not setup_evt.wait(timeout=5.0):
-                    raise TimeoutError(f"Timeout creating acceleration logger for {name}")
+                if not setup_evt.wait(timeout=5.0) or len(loggers) < 2:
+                    err_msg = logger_err[0] or f"Timeout creating acceleration logger for {name}"
+                    raise TimeoutError(err_msg)
 
                 # Start logging and sensor fusion
                 libmetawear.mbl_mw_logging_start(board, 0)
@@ -374,137 +397,343 @@ class BoardManager:
         print(f"\n✓ Successfully armed {len(armed_sensors)} of {len(self.sensors)} sensors.")
         return armed_sensors
 
-    def download_sensors(self, output_dir: Path, target_sensors: list = None) -> dict:
-        """Sequential download: reconnect to each sensor, download logged data, save raw CSVs.
+    def stop_sensors(self, target_sensors: list = None) -> list:
+        """Immediately halt logging and sensor fusion on all armed sensors.
 
-        Resilient: if a sensor dropped off mid-trial, it is marked as failed and skipped
-        without crashing the download for the remaining healthy sensors.
+        Freezes flash memory right after the trial countdown finishes, preventing
+        sensors from continuing to record unwanted data during sequential/parallel downloads.
+        """
+        sensors_to_stop = target_sensors if target_sensors is not None else self.sensors
+        print(f"\n=== Stopping Logging on {len(sensors_to_stop)} Sensors Immediately ===")
+
+        stopped = []
+        failed = []
+
+        def _stop_single(sensor_info, assigned_hci):
+            name = sensor_info["name"]
+            mac = sensor_info["mac"]
+            dev = None
+            try:
+                dev = self._connect_device(mac, hci_mac=assigned_hci, max_retries=2, timeout_s=8.0)
+                board = dev.board
+                libmetawear.mbl_mw_logging_stop(board)
+                libmetawear.mbl_mw_sensor_fusion_stop(board)
+                libmetawear.mbl_mw_logging_flush_page(board)
+                time.sleep(0.2)
+                dev.disconnect()
+                time.sleep(0.4)
+                with self._print_lock:
+                    print(f"  ✓ {name} logging stopped.")
+                return (name, True, None)
+            except Exception as e:
+                with self._print_lock:
+                    print(f"  ⚠️ Warning: Could not stop {name} during sweep ({e}). Will stop during download.")
+                if dev:
+                    try:
+                        dev.disconnect()
+                    except Exception:
+                        pass
+                return (name, False, str(e))
+
+        num_adapters = len(self.hci_macs)
+        if num_adapters > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            import queue
+
+            sensor_q = queue.Queue()
+            for s in sensors_to_stop:
+                sensor_q.put(s)
+
+            def stop_worker(adapter_mac):
+                while True:
+                    try:
+                        sensor = sensor_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    s_name, ok, err = _stop_single(sensor, adapter_mac)
+                    if ok:
+                        stopped.append(s_name)
+                    else:
+                        failed.append((s_name, err))
+                    sensor_q.task_done()
+
+            with ThreadPoolExecutor(max_workers=num_adapters) as executor:
+                futures = [executor.submit(stop_worker, mac) for mac in self.hci_macs]
+                for f in futures:
+                    f.result()
+        else:
+            for s in sensors_to_stop:
+                s_name, ok, err = _stop_single(s, self.hci_mac)
+                if ok:
+                    stopped.append(s_name)
+                else:
+                    failed.append((s_name, err))
+
+        print(f"✓ Stop sweep complete: {len(stopped)} of {len(sensors_to_stop)} confirmed stopped.\n")
+        return stopped
+
+    def _download_single_sensor(self, sensor: dict, output_dir: Path, assigned_hci: str) -> dict:
+        """Download logged data from a single sensor using a designated Bluetooth adapter."""
+        name = sensor["name"]
+        mac = sensor["mac"]
+        with self._print_lock:
+            print(f"\nConnecting to {name} ({mac}) for download...")
+
+        quat_data = []
+        accel_data = []
+        dev = None
+
+        try:
+            dev = self._connect_device(mac, hci_mac=assigned_hci, max_retries=3)
+            board = dev.board
+
+            # 1. Query anonymous data signals on the reconnected board first
+            discovery_evt = Event()
+            discovered = {}
+
+            def signal_handler(ctx, b, signals, length):
+                discovered['length'] = length
+                discovered['signals'] = cast(signals, POINTER(c_void_p * length)) if signals else None
+                discovery_evt.set()
+
+            sig_fn = FnVoid_VoidP_VoidP_VoidP_UInt(signal_handler)
+            with self._print_lock:
+                self._callbacks.append(sig_fn)
+
+            libmetawear.mbl_mw_metawearboard_create_anonymous_datasignals(board, None, sig_fn)
+            if not discovery_evt.wait(timeout=10.0):
+                raise TimeoutError(f"Timeout discovering anonymous signals on {name}")
+
+            num_signals = discovered.get('length', 0)
+            with self._print_lock:
+                print(f"  Discovered {num_signals} active log streams on {name}")
+
+            # 2. Stop fusion and logging, flush page buffer (safe & idempotent)
+            libmetawear.mbl_mw_logging_stop(board)
+            libmetawear.mbl_mw_sensor_fusion_stop(board)
+            libmetawear.mbl_mw_logging_flush_page(board)
+            time.sleep(0.3)
+
+            # Tracking variables for live feedback and stall detection
+            download_evt = Event()
+            last_print_time = [0.0]
+            last_data_time = [time.time()]
+            total_entries_count = [0]
+            entries_left_count = [0]
+
+            # 3. Subscribe to data streams
+            def data_handler(ctx, p):
+                last_data_time[0] = time.time()
+                val = parse_value(p)
+                epoch = p.contents.epoch
+                if hasattr(val, 'w'):
+                    quat_data.append([epoch, val.w, val.x, val.y, val.z])
+                elif hasattr(val, 'x'):
+                    accel_data.append([epoch, val.x, val.y, val.z])
+
+                now = time.time()
+                if total_entries_count[0] == 0 and now - last_print_time[0] >= 1.5:
+                    with self._print_lock:
+                        print(f"  [{name}] Receiving data stream... {len(quat_data)} quat, {len(accel_data)} accel samples")
+                    last_print_time[0] = now
+
+            data_cb = FnVoid_VoidP_DataP(data_handler)
+            with self._print_lock:
+                self._callbacks.append(data_cb)
+
+            if discovered.get('signals'):
+                for i in range(num_signals):
+                    sig_ptr = discovered['signals'].contents[i]
+                    libmetawear.mbl_mw_anonymous_datasignal_subscribe(sig_ptr, None, data_cb)
+
+            # 4. Download handler with fine-grained progress updates
+            def progress_handler(ctx, entries_left, total_entries):
+                total_entries_count[0] = total_entries
+                entries_left_count[0] = entries_left
+                if total_entries == 0:
+                    with self._print_lock:
+                        print(f"  [{name}] Sensor reports 0 log entries to download.")
+                    download_evt.set()
+                    return
+                downloaded = total_entries - entries_left
+                pct = (downloaded / total_entries) * 100
+                now = time.time()
+                if now - last_print_time[0] >= 1.0 or entries_left == 0:
+                    with self._print_lock:
+                        print(f"  [{name}] Download: {pct:5.1f}% ({downloaded}/{total_entries} entries) | {len(quat_data)} quats, {len(accel_data)} accels")
+                    last_print_time[0] = now
+                if entries_left == 0:
+                    download_evt.set()
+
+            prog_fn = FnVoid_VoidP_UInt_UInt(progress_handler)
+            with self._print_lock:
+                self._callbacks.append(prog_fn)
+
+            def unknown_entry_handler(ctx, id, epoch, data, length):
+                pass
+            unk_fn = FnVoid_VoidP_UByte_Long_UByteP_UByte(unknown_entry_handler)
+            with self._print_lock:
+                self._callbacks.append(unk_fn)
+
+            download_handler = LogDownloadHandler(
+                context=None,
+                received_progress_update=prog_fn,
+                received_unknown_entry=unk_fn,
+                received_unhandled_entry=cast(None, FnVoid_VoidP_DataP)
+            )
+
+            with self._print_lock:
+                print(f"  Downloading log entries from {name}...")
+            # Request 100 notification updates for smooth, fine-grained progress reporting
+            libmetawear.mbl_mw_logging_download(board, 100, byref(download_handler))
+
+            download_start = time.time()
+            stall_threshold_s = 20.0  # Stalled if no packets received for 20s
+            start_timeout_s = 25.0    # Stalled if download never begins after 25s
+
+            stalled = False
+            while not download_evt.is_set():
+                time_since_data = time.time() - last_data_time[0]
+                elapsed = time.time() - download_start
+                total_samples = len(quat_data) + len(accel_data)
+
+                # Only declare stalled if incoming packet flow has completely frozen
+                if total_samples > 0 and time_since_data > stall_threshold_s:
+                    with self._print_lock:
+                        print(f"\n  ⚠️ [{name}] Download stalled: no new data packets received for {int(time_since_data)}s.")
+                        print(f"  [{name}] Preserving {len(quat_data)} quat and {len(accel_data)} accel samples received before stall.")
+                    stalled = True
+                    break
+
+                if total_samples == 0 and elapsed > start_timeout_s:
+                    with self._print_lock:
+                        print(f"\n  ⚠️ [{name}] Download failed to start: no data packets received after {int(elapsed)}s.")
+                    stalled = True
+                    break
+
+                download_evt.wait(timeout=0.5)
+
+            if not stalled:
+                if total_entries_count[0] > 0:
+                    with self._print_lock:
+                        print(f"  [{name}] Download: 100.0% ({total_entries_count[0]}/{total_entries_count[0]} entries) | {len(quat_data)} quats, {len(accel_data)} accels")
+
+                # Clear flash entries and tear down board state only upon clean completion
+                libmetawear.mbl_mw_logging_clear_entries(board)
+                time.sleep(3.0)  # Wait for physical SPI NOR flash sector erase
+                libmetawear.mbl_mw_event_remove_all(board)
+                libmetawear.mbl_mw_macro_erase_all(board)
+                libmetawear.mbl_mw_metawearboard_tear_down(board)
+                time.sleep(0.5)
+
+                try:
+                    dev.disconnect()
+                except Exception:
+                    pass
+                time.sleep(1.0)
+            else:
+                try:
+                    dev.disconnect()
+                except Exception:
+                    pass
+                time.sleep(2.0)
+
+            # Save raw CSVs
+            quat_file = output_dir / f"{name}_quat.csv"
+            with open(quat_file, mode="w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["epoch_ms", "q0_w", "q1_x", "q2_y", "q3_z"])
+                writer.writerows(quat_data)
+
+            accel_file = output_dir / f"{name}_accel.csv"
+            with open(accel_file, mode="w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["epoch_ms", "acc_x", "acc_y", "acc_z"])
+                writer.writerows(accel_data)
+
+            with self._print_lock:
+                print(f"  ✓ Saved {len(quat_data)} quat rows -> {quat_file.name}")
+                print(f"  ✓ Saved {len(accel_data)} accel rows -> {accel_file.name}")
+
+            return {
+                "sensor_name": name,
+                "quat_file": quat_file,
+                "accel_file": accel_file,
+                "num_quats": len(quat_data),
+                "num_accels": len(accel_data),
+            }
+
+        except (KeyboardInterrupt, BaseException) as exc:
+            # Clean teardown on interrupt to prevent segfault in Warble C++ thread
+            if dev is not None:
+                try:
+                    libmetawear.mbl_mw_logging_stop(dev.board)
+                except Exception:
+                    pass
+                try:
+                    dev.disconnect()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            raise exc
+
+    def download_sensors(self, output_dir: Path, target_sensors: list = None) -> dict:
+        """Download logged data from sensors.
+
+        Runs concurrently across available Bluetooth adapters when multiple are detected,
+        or sequentially when a single adapter is in use.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         sensors_to_download = target_sensors if target_sensors is not None else self.sensors
-        print(f"\n=== Downloading Data from {len(sensors_to_download)} Sensors Sequentially ===")
+        num_adapters = len(self.hci_macs)
+
+        if num_adapters > 1:
+            print(f"\n=== Downloading Data from {len(sensors_to_download)} Sensors Concurrently ({num_adapters} Bluetooth Adapters) ===")
+        else:
+            print(f"\n=== Downloading Data from {len(sensors_to_download)} Sensors Sequentially ===")
+
         downloaded_files = {}
         failed_downloads = []
 
-        for sensor in sensors_to_download:
-            name = sensor["name"]
-            mac = sensor["mac"]
-            print(f"\nConnecting to {name} ({mac}) for download...")
+        if num_adapters > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            import queue
 
-            quat_data = []
-            accel_data = []
-            callbacks = []
+            # Use a task queue so workers dynamically pull next sensor when ready
+            sensor_q = queue.Queue()
+            for s in sensors_to_download:
+                sensor_q.put(s)
 
-            try:
-                dev = self._connect_device(mac, max_retries=3)
-                board = dev.board
+            def worker_loop(adapter_mac):
+                while True:
+                    try:
+                        sensor = sensor_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    s_name = sensor["name"]
+                    try:
+                        res = self._download_single_sensor(sensor, output_dir, assigned_hci=adapter_mac)
+                        downloaded_files[s_name] = res
+                    except Exception as e:
+                        with self._print_lock:
+                            print(f"  ✗ FAILED TO DOWNLOAD FROM {s_name}: {e}")
+                        failed_downloads.append((s_name, str(e)))
+                    finally:
+                        sensor_q.task_done()
 
-                # Stop fusion and logging
-                libmetawear.mbl_mw_sensor_fusion_stop(board)
-                libmetawear.mbl_mw_sensor_fusion_clear_enabled_mask(board)
-                libmetawear.mbl_mw_logging_stop(board)
-
-                # Flush NAND page buffer
-                libmetawear.mbl_mw_logging_flush_page(board)
-                time.sleep(0.8)
-
-                # Query anonymous data signals on the reconnected board
-                discovery_evt = Event()
-                discovered = {}
-
-                def signal_handler(ctx, b, signals, length):
-                    discovered['length'] = length
-                    discovered['signals'] = cast(signals, POINTER(c_void_p * length)) if signals else None
-                    discovery_evt.set()
-
-                sig_fn = FnVoid_VoidP_VoidP_VoidP_UInt(signal_handler)
-                callbacks.append(sig_fn)
-
-                libmetawear.mbl_mw_metawearboard_create_anonymous_datasignals(board, None, sig_fn)
-                if not discovery_evt.wait(timeout=10.0):
-                    raise TimeoutError(f"Timeout discovering anonymous signals on {name}")
-
-                num_signals = discovered.get('length', 0)
-                print(f"  Discovered {num_signals} active log streams on {name}")
-
-                # Subscribe to data streams
-                def data_handler(ctx, p):
-                    val = parse_value(p)
-                    epoch = p.contents.epoch
-                    if hasattr(val, 'w'):
-                        quat_data.append([epoch, val.w, val.x, val.y, val.z])
-                    elif hasattr(val, 'x'):
-                        accel_data.append([epoch, val.x, val.y, val.z])
-
-                data_cb = FnVoid_VoidP_DataP(data_handler)
-                callbacks.append(data_cb)
-
-                if discovered.get('signals'):
-                    for i in range(num_signals):
-                        sig_ptr = discovered['signals'].contents[i]
-                        libmetawear.mbl_mw_anonymous_datasignal_subscribe(sig_ptr, None, data_cb)
-
-                # Download handler
-                download_evt = Event()
-                last_time = [time.time()]
-
-                def progress_handler(ctx, entries_left, total_entries):
-                    if total_entries > 0:
-                        now = time.time()
-                        if now - last_time[0] >= 3.0 or entries_left == 0:
-                            pct = ((total_entries - entries_left) / total_entries) * 100
-                            print(f"  [{name}] Download: {pct:.1f}% ({total_entries - entries_left}/{total_entries})")
-                            last_time[0] = now
-                    if entries_left == 0:
-                        download_evt.set()
-
-                prog_fn = FnVoid_VoidP_UInt_UInt(progress_handler)
-                callbacks.append(prog_fn)
-
-                download_handler = LogDownloadHandler(
-                    context=None,
-                    received_progress_update=prog_fn,
-                    received_unknown_entry=cast(None, FnVoid_VoidP_UByte_Long_UByteP_UByte),
-                    received_unhandled_entry=cast(None, FnVoid_VoidP_DataP)
-                )
-
-                print(f"  Downloading log entries from {name}...")
-                libmetawear.mbl_mw_logging_download(board, 100, byref(download_handler))
-                if not download_evt.wait(timeout=120.0):
-                    print(f"  ⚠️ WARNING: Download timeout reached for {name}")
-
-                # Clear flash entries after successful download
-                libmetawear.mbl_mw_logging_clear_entries(board)
-                time.sleep(0.5)
-
-                dev.disconnect()
-                time.sleep(0.8)
-
-                # Save raw CSVs
-                quat_file = output_dir / f"{name}_quat.csv"
-                with open(quat_file, mode="w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["epoch_ms", "q0_w", "q1_x", "q2_y", "q3_z"])
-                    writer.writerows(quat_data)
-                print(f"  ✓ Saved {len(quat_data)} quat rows -> {quat_file.name}")
-
-                accel_file = output_dir / f"{name}_accel.csv"
-                with open(accel_file, mode="w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["epoch_ms", "acc_x", "acc_y", "acc_z"])
-                    writer.writerows(accel_data)
-                print(f"  ✓ Saved {len(accel_data)} accel rows -> {accel_file.name}")
-
-                downloaded_files[name] = {
-                    "quat_file": quat_file,
-                    "accel_file": accel_file,
-                    "num_quats": len(quat_data),
-                    "num_accels": len(accel_data),
-                }
-
-            except Exception as e:
-                print(f"  ✗ FAILED TO DOWNLOAD FROM {name}: {e}")
-                failed_downloads.append((name, str(e)))
+            with ThreadPoolExecutor(max_workers=num_adapters) as executor:
+                futures = [executor.submit(worker_loop, mac) for mac in self.hci_macs]
+                for f in futures:
+                    f.result()
+        else:
+            for sensor in sensors_to_download:
+                name = sensor["name"]
+                try:
+                    res = self._download_single_sensor(sensor, output_dir, assigned_hci=self.hci_mac)
+                    downloaded_files[name] = res
+                except Exception as e:
+                    print(f"  ✗ FAILED TO DOWNLOAD FROM {name}: {e}")
+                    failed_downloads.append((name, str(e)))
 
         if failed_downloads:
             print(f"\n⚠️ WARNING: {len(failed_downloads)} sensor(s) failed during download:")

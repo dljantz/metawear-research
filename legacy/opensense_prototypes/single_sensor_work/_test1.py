@@ -1,8 +1,23 @@
 from mbientlab.metawear.cbindings import * # allows comm with underlying C++ library
 from mbientlab.warble import * # Warble is a custom BLE library
 from mbientlab.metawear import * # core metawear functionality
+import sys
+from pathlib import Path
 from threading import Event
 import time
+
+# Add project root for bluetooth_utils import
+for parent in Path(__file__).resolve().parents:
+    if (parent / "pipeline").exists():
+        sys.path.insert(0, str(parent))
+        break
+
+from pipeline.core.bluetooth_utils import ensure_bluetooth_ready
+
+# Ensure Bluetooth adapter is unblocked and powered on (blue LED on)
+adapter_info = ensure_bluetooth_ready(auto_power_on=True)
+HCI_MAC = adapter_info["mac"]
+print(f"Active Bluetooth Adapter: {HCI_MAC} (Blue LED ON)")
 
 e = Event() # internal flag that communicates between main script and background bluetooth scanning process
 address = None # to eventually hold MAC address of the sensor
@@ -14,10 +29,10 @@ def device_discover_task(result): # callback function -- executes every time a n
         e.set() # change Event flag from False to True
 
 BleScanner.set_handler(device_discover_task) # hand newly created callback function to Warble -- tell it to evaluate every device it sees
-BleScanner.start() # start scanning for bluetooth devices
+BleScanner.start(hci=HCI_MAC) # start scanning for bluetooth devices using active adapter
 e.wait() # wait indefinitely until background scanner triggers e.set()
 print("grabbed first discovered metawear device with address " + address)
-device = MetaWear(address) # create MetaWear object
+device = MetaWear(address, hci_mac=HCI_MAC) # create MetaWear object
 #print("made it to point A")
 try:
     device.connect()

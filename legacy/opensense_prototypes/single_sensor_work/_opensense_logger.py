@@ -1,14 +1,28 @@
 import sys
+from pathlib import Path
 from time import sleep
 from threading import Event
+
+# Add project root for bluetooth_utils import
+for parent in Path(__file__).resolve().parents:
+    if (parent / "pipeline").exists():
+        sys.path.insert(0, str(parent))
+        break
+
+from pipeline.core.bluetooth_utils import ensure_bluetooth_ready
 from mbientlab.metawear import MetaWear, libmetawear, parse_value, create_voidp
 from mbientlab.metawear.cbindings import *
+
+# Ensure Bluetooth adapter is unblocked and powered on (blue LED on)
+adapter_info = ensure_bluetooth_ready(auto_power_on=True)
+HCI_MAC = adapter_info["mac"]
+print(f"Active Bluetooth Adapter: {HCI_MAC} (Blue LED ON)")
 
 MAC_ADDRESS = "D8:FB:07:F7:24:50" 
 OUTPUT_FILE = "opensense_orientations.sto"
 
 print(f"Connecting to {MAC_ADDRESS}...")
-device = MetaWear(MAC_ADDRESS)
+device = MetaWear(MAC_ADDRESS, hci_mac=HCI_MAC)
 device.connect()
 print("Connected successfully!")
 

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<OpenSimDocument Version="40000">
+    <IMUInverseKinematicsTool>
+        <model_file_name>Rajagopal_calibrated.osim</model_file_name>
+        <orientations_file_name>synchronized_kinematics.sto</orientations_file_name>
+        <sensor_to_opensim_rotations>-1.57079632679 0 0</sensor_to_opensim_rotations>
+        <time_range>0 10.00</time_range>
+        <results_directory>IKResults</results_directory>
+    </IMUInverseKinematicsTool>
+</OpenSimDocument>

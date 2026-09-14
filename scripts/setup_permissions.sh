@@ -52,7 +52,21 @@ fi
 echo "4. Ensuring user '$USER' is in 'bluetooth' group..."
 sudo usermod -aG bluetooth "$USER"
 
+echo "5. Enabling and starting systemd bluetooth service..."
+sudo systemctl enable bluetooth
+sudo systemctl start bluetooth
+
+echo "6. Configuring udev rule for auto-powering USB Bluetooth dongle upon insertion..."
+UDEV_RULE_FILE="/etc/udev/rules.d/99-metawear-bluetooth.rules"
+sudo bash -c "cat << 'EOF' > $UDEV_RULE_FILE
+# Auto unblock and power on Realtek Bluetooth adapter upon USB attachment
+ACTION==\"add\", SUBSYSTEM==\"bluetooth\", KERNEL==\"hci[0-9]*\", RUN+=\"/usr/sbin/rfkill unblock bluetooth\", RUN+=\"/usr/bin/bluetoothctl power on\"
+EOF"
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=bluetooth
+
 echo ""
-echo "✓ Permissions configured successfully!"
+echo "✓ Permissions and Bluetooth auto-power configured successfully!"
 echo "You can now run scripts directly without sudo:"
-echo "  $VENV_PYTHON pipeline/cli.py list"
+echo "  $VENV_PYTHON pipeline/cli.py ble-check"
+echo "  $VENV_PYTHON pipeline/cli.py test"

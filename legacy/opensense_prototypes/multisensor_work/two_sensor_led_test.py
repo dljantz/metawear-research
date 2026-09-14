@@ -4,15 +4,31 @@ from mbientlab.metawear import * # core metawear functionality
 from threading import Event
 import time
 
+import sys
+from pathlib import Path
+
+# Add project root for bluetooth_utils import
+for parent in Path(__file__).resolve().parents:
+    if (parent / "pipeline").exists():
+        sys.path.insert(0, str(parent))
+        break
+
+from pipeline.core.bluetooth_utils import ensure_bluetooth_ready
+
 e = Event() # internal flag that communicates between main script and background bluetooth scanning process
 address0 = "D8:FB:07:F7:24:50"
 address1 = "F3:A3:7B:95:51:CD"
 
+# Ensure Bluetooth adapter is unblocked and powered on (blue LED on)
+adapter_info = ensure_bluetooth_ready(auto_power_on=True)
+hci_mac = adapter_info["mac"]
+print(f"Active Bluetooth Adapter: {hci_mac} (Blue LED ON)")
+
 #BleScanner.start() # start scanning for bluetooth devices
 #e.wait() # wait indefinitely until background scanner triggers e.set()
 #print("grabbed first discovered metawear device with address " + address)
-device0 = MetaWear(address0) # create MetaWear object
-device1 = MetaWear(address1)
+device0 = MetaWear(address0, hci_mac=hci_mac) # create MetaWear object
+device1 = MetaWear(address1, hci_mac=hci_mac)
 
 #print("made it to point A")
 try:
